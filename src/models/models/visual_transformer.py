@@ -42,8 +42,6 @@ class VisualGeometryTransformer(nn.Module):
         enable_condition (bool): Whether to enable conditioning inputs.
         sampling_strategy (str): Sampling strategy for patches.
         fixed_patch_embed (bool): Whether to fix patch embedding weights.
-        enable_interpolation (bool): Whether to enable position interpolation.
-        max_resolution (int): Maximum resolution for position interpolation.
         condition_strategy (list[str]): Strategy for each conditioning input.
     """
 
@@ -67,8 +65,6 @@ class VisualGeometryTransformer(nn.Module):
         enable_cond=False,
         sampling_strategy="uniform",
         fixed_patch_embed=False,
-        enable_interpolation=False,
-        max_resolution=2044,
         condition_strategy=["token", "pow3r", "token"],
         intermediate_idxs: List[int] = [4, 11, 17, 23]
     ):
@@ -92,7 +88,7 @@ class VisualGeometryTransformer(nn.Module):
             self._init_cond_embeddings(embed_dim, img_size, patch_size, num_register_tokens)
             
         # Initialize rotary position embedding
-        self._init_rotary_position_embedding(rope_freq, enable_interpolation, max_resolution)
+        self._init_rotary_position_embedding(rope_freq)
         
         # Initialize transformer blocks
         self._init_transformer_blocks(block_fn, embed_dim, num_heads, mlp_ratio, qkv_bias, proj_bias, ffn_bias, init_values, qk_norm)
@@ -108,9 +104,9 @@ class VisualGeometryTransformer(nn.Module):
 
         # Register normalization constants
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
-            self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
+            self.register_buffer(name, torch.FloatTensor(value).reshape(1, 1, 3, 1, 1), persistent=False)
 
-        self.use_reentrant_checkpointing = False
+        self.use_reentrant = False
 
     def _init_patch_embedding_module(
         self,
@@ -207,7 +203,7 @@ class VisualGeometryTransformer(nn.Module):
         else:
             raise NotImplementedError
 
-    def _init_rotary_position_embedding(self, rope_freq, enable_interpolation, max_resolution):
+    def _init_rotary_position_embedding(self, rope_freq):
         self.rope = RotaryPositionEmbedding2D(
             frequency=rope_freq, 
         ) if rope_freq > 0 else None
@@ -278,7 +274,7 @@ class VisualGeometryTransformer(nn.Module):
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):           
             images = (images - self._resnet_mean) / self._resnet_std
-            images = images.view(b * seq_len, ch, h, w)
+            images = images.reshape(b * seq_len, ch, h, w)
             patch_tokens = self.patch_embed(images)
             if isinstance(patch_tokens, dict):
                 patch_tokens = patch_tokens["x_norm_patchtokens"]
@@ -351,7 +347,7 @@ class VisualGeometryTransformer(nn.Module):
         # Process camera pose embedding
         use_poses = (cond_flags[0] == 1 and poses is not None)
         if use_poses:
-            poses = poses.view(b*seq_len, -1)
+            poses = poses.reshape(b*seq_len, -1)
             pose_tokens = self.pose_embed(poses).unsqueeze(1)
         else:
             pose_tokens = torch.zeros((b*seq_len, 1, embed_dim), device=images.device, dtype=images.dtype)
@@ -359,7 +355,7 @@ class VisualGeometryTransformer(nn.Module):
         # Process depth map embedding
         use_depth = cond_flags[1] == 1 and depth_maps is not None
         if use_depth:
-            depth_maps = depth_maps.view(b*seq_len, 1, h, w)
+            depth_maps = depth_maps.reshape(b*seq_len, 1, h, w)
             depth_tokens = self.depth_embed(depth_maps).reshape(b * seq_len, patch_count, embed_dim)
         else:
             depth_tokens = torch.zeros((b*seq_len, patch_count, embed_dim), device=images.device, dtype=images.dtype)
@@ -367,7 +363,7 @@ class VisualGeometryTransformer(nn.Module):
         # Process ray direction embedding
         use_rays = cond_flags[2] == 1 and ray_dirs is not None
         if use_rays:
-            ray_dirs = ray_dirs.view(b*seq_len, -1)
+            ray_dirs = ray_dirs.reshape(b*seq_len, -1)
             ray_tokens = self.ray_embed(ray_dirs).unsqueeze(1)
         else:
             ray_tokens = torch.zeros((b*seq_len, 1, embed_dim), device=images.device, dtype=images.dtype)
@@ -385,14 +381,17 @@ class VisualGeometryTransformer(nn.Module):
             pos_target_shape = (b, seq_len * patch_count, 2) if pos is not None else None
         
         if tokens.shape != target_shape:
-            tokens = tokens.view(*target_shape)
+            tokens = tokens.reshape(*target_shape)
         
         if pos is not None and pos.shape != pos_target_shape:
-            pos = pos.view(*pos_target_shape)
-
-        tokens = blocks[block_idx](tokens, pos=pos)
+            pos = pos.reshape(*pos_target_shape)
+        
+        if self.training:
+            tokens = checkpoint(blocks[block_idx], tokens, pos=pos, use_reentrant=self.use_reentrant)
+        else:
+            tokens = blocks[block_idx](tokens, pos=pos)
             
-        return tokens.view(*token_shape)
+        return tokens.reshape(*token_shape)
 
 
 def expand_and_flatten_special_tokens(token_tensor, b, seq_len):
@@ -414,4 +413,4 @@ def expand_and_flatten_special_tokens(token_tensor, b, seq_len):
     
     # Concatenate and flatten
     combined_tokens = torch.cat([first_frame_tokens, remaining_frame_tokens], dim=1)
-    return combined_tokens.view(b * seq_len, *combined_tokens.shape[2:])
+    return combined_tokens.reshape(b * seq_len, *combined_tokens.shape[2:])

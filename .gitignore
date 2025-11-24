@@ -5,3 +5,4 @@ __pycache__/
 inference_output/
 submodules/gsplat/examples/pycolmap/
 skyseg.onnx
+wandb/

@@ -1,0 +1,6 @@
+[submodule "third_party/Omni6DPoseAPI"]
+	path = third_party/Omni6DPoseAPI
+	url = https://github.com/Omni6DPose/Omni6DPoseAPI.git
+[submodule "submodules/Omni6DPoseAPI"]
+	path = submodules/Omni6DPoseAPI
+	url = https://github.com/Omni6DPose/Omni6DPoseAPI.git
