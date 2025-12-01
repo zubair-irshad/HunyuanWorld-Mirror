@@ -1,8 +1,5 @@
 import os
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torch.amp import autocast, GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torchvision
@@ -13,10 +10,7 @@ from tqdm import tqdm
 from functools import partial
 import torch.distributed as dist
 import gc
-
-# ---- Dataset + utils ----
-# from training.data.datasets.sope_dataloader import DynamicCenterSnapLoader
-# from training.data.datasets.sope_dataset import SopeCentersnapDataset
+# from torch.amp import autocast, GradScaler
 from training.data.datasets.webdataloader_utils import build_sope_wds_loader
 from cutoop.utils import draw_3d_bbox, draw_pose_axes
 from training.data.datasets.utils import extract_peaks_from_centroid, extract_abs_pose_from_peaks, draw_peaks
@@ -56,13 +50,13 @@ class HParams:
         self.loss_abs_pose_mult = 0.1
         self.loss_z_centroid_mult = 0.1
 
-        self.batch_size = 20
+        self.batch_size = 32
         self.num_workers = 3
 
         # self.shards = "/home/mirshad7/Downloads/data/Omni6DPose/SOPE_webdataset/sope-{000000..000850}.tar"
         # self.test_shards = "/home/mirshad7/Downloads/data/Omni6DPose/SOPE_webdataset_test/sope-{000000..000099}.tar"
 
-        self.shards = "/home/mirshad7/Downloads/data/Omni6DPose/SOPE_webdataset"
+        self.shards = "/mnt/ssd/SOPE_webdataset"
         self.test_shards = "/home/mirshad7/Downloads/data/Omni6DPose/SOPE_webdataset_test"
         self.no_pin_memory = False
         self.persistent_workers = False
@@ -277,6 +271,17 @@ def train():
     total_training_steps = 11000 * 30
     scheduler = CosineAnnealingLR(optimizer, T_max=total_training_steps, eta_min=1e-8)
     global_step = 0
+
+    # scaler = GradScaler()
+    log_interval = 100  # how often to log
+    running_loss = 0.0
+    running_dict = {
+        "heatmap_loss": 0.0,
+        "abs_rot_loss": 0.0,
+        "tran_size_loss": 0.0,
+        "pose_loss": 0.0,
+    }
+
     # print("len train loader:", len(train_loader))
     for epoch in range(30):
         train_loader = build_sope_wds_loader(
@@ -284,22 +289,30 @@ def train():
             batch_size=hparams.batch_size,
             num_workers=hparams.num_workers,
             bufsize=2000,
-            initial=500
+            initial=500,
+            epoch=epoch
         )
 
         # loader = loader_builder.get_loader(epoch)
-        epoch_loss = 0
+        epoch_loss = 0.0
         model.train()   
 
         # Iterate until natural exhaustion (all shards consumed)
         # pbar = tqdm(train_loader, desc=f"Epoch {epoch}", total=batches_per_epoch)
         # for batch in pbar:
         num_batches = 0
+
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}"):
             depth = normalize_depth_fixed(batch["depth"])
             rgb = batch["rgb"].to(device, non_blocking=True)
             
             depth = depth.to(device, non_blocking=True)
+
+
+            # with autocast(device_type="cuda"):
+            #     preds = model(rgb, depth)
+            #     loss, loss_dict = compute_loss(preds, batch)
+
             preds = model(rgb, depth)
             loss, loss_dict = compute_loss(preds, batch)
 
@@ -308,23 +321,62 @@ def train():
             optimizer.step()    
             scheduler.step()
 
-            if rank == 0:  # Only rank 0 logs scalars to wandb
+            # optimizer.zero_grad(set_to_none=True)
+            # scaler.scale(loss).backward()
+            # scaler.step(optimizer)
+            # scaler.update()
+            # scheduler.step()
+            
+            # ---- Accumulate for averaging ----
+            running_loss += loss.detach()
+            for k in running_dict.keys():
+                if k in loss_dict:
+                    running_dict[k] += loss_dict[k]
+
+            epoch_loss += loss.detach()
+                    
+            num_batches += 1
+            global_step += 1
+            
+            # ---- Log every N steps ----
+            if (global_step + 1) % log_interval == 0 and rank == 0:
+                avg_loss = (running_loss / log_interval)
+                avg_dict = {k: (v / log_interval) for k, v in running_dict.items()}
+
                 wandb.log(
                     {
-                        "train/loss": loss.item(),
-                        "train/loss_heat": loss_dict["heatmap_loss"],
-                        "train/loss_pose": loss_dict["pose_loss"],
-                        "train/loss_rot": loss_dict["rot_loss"],
-                        "train/loss_trans": loss_dict["trans_loss"],
-                        "train/loss_size": loss_dict["size_loss"],
+                        "train/total_loss": avg_loss,
+                        "train/heatmap_loss": avg_dict["heatmap_loss"],
+                        "train/rot_loss": avg_dict["abs_rot_loss"],
+                        "train/tran_size_loss": avg_dict["tran_size_loss"],
+                        "train/pose_loss": avg_dict["pose_loss"],
                         "lr": optimizer.param_groups[0]["lr"],
                     },
                     step=global_step,
                 )
 
-            epoch_loss += loss.item()
-            global_step += 1
-            num_batches += 1
+                # reset accumulators
+                running_loss = 0.0
+                for k in running_dict.keys():
+                    running_dict[k] = 0.0
+                    
+            # if rank == 0:  # Only rank 0 logs scalars to wandb
+            #     wandb.log(
+            #         {
+            #             "train/loss": loss.item(),
+            #             "train/loss_heat": loss_dict["heatmap_loss"],
+            #             "train/loss_pose": loss_dict["pose_loss"],
+            #             "train/loss_rot": loss_dict["rot_loss"],
+            #             "train/loss_trans": loss_dict["trans_loss"],
+            #             "train/loss_size": loss_dict["size_loss"],
+            #             "lr": optimizer.param_groups[0]["lr"],
+            #         },
+            #         step=global_step,
+            #     )
+
+            # epoch_loss += loss.item()
+            # global_step += 1
+            # num_batches += 1
                 
             # Visualization only on rank 0 to avoid multi-process contention.
             if rank == 0 and global_step % 8000 == 0:
@@ -335,10 +387,16 @@ def train():
                     wandb.log({"train/visualizations_pred": wandb.Image(grid_pred)}, step=global_step)
 
                     del grid_gt, grid_pred
-        avg_loss = epoch_loss / num_batches
-        print(f"Epoch {epoch}: avg_loss={avg_loss:.4f} steps={num_batches}")
+        
+        # avg_loss = epoch_loss / num_batches
+
+        avg_epoch_loss = (epoch_loss / num_batches)
+        if torch.is_tensor(avg_epoch_loss):
+            avg_epoch_loss = avg_epoch_loss.item()
+            
+        print(f"Epoch {epoch}: avg_loss={avg_epoch_loss:.4f} steps={num_batches}")
         if rank == 0:
-            wandb.log({"epoch_loss": avg_loss}, step=global_step)
+            wandb.log({"epoch_loss": avg_epoch_loss}, step=global_step)
 
         del train_loader
         gc.collect()
@@ -353,13 +411,13 @@ def train():
                 shards_glob=hparams.test_shards,
                 batch_size=hparams.batch_size,
                 num_workers=hparams.num_workers,
-                epoch=epoch,
                 bufsize=500,
                 initial=100
             )
 
             test_epoch_loss = 0
-            test_loss_each = {"heatmap_loss": 0, "pose_loss": 0, "rot_loss": 0, "trans_loss": 0, "size_loss": 0}
+            # test_loss_each = {"heatmap_loss": 0, "pose_loss": 0, "rot_loss": 0, "trans_loss": 0, "size_loss": 0}
+            test_loss_each = {"heatmap_loss": 0, "abs_rot_loss": 0, "tran_size_loss": 0, "pose_loss": 0}
             # pbar_test = tqdm(test_loader, desc=f"Test Epoch {epoch}")
             # for batch in pbar_test:
             num_test_batches = 0
@@ -369,7 +427,7 @@ def train():
                 depth = depth.to(device, non_blocking=True)
                 preds = model(rgb, depth)
                 loss, loss_dict = compute_loss(preds, batch)
-                test_epoch_loss += loss.item()
+                test_epoch_loss += loss.detach()
                 num_test_batches += 1
 
                 if num_test_batches%800 == 0:
@@ -387,7 +445,9 @@ def train():
                     test_loss_each[k] += loss_dict[k]
 
 
-            avg_test_loss = test_epoch_loss / num_test_batches
+            avg_test_loss = (test_epoch_loss / num_test_batches)
+            if torch.is_tensor(avg_test_loss):
+                avg_test_loss = avg_test_loss.item()
             for k in test_loss_each.keys():
                 test_loss_each[k] /= num_test_batches
                 if rank == 0:

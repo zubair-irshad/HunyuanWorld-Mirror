@@ -7,6 +7,19 @@ from cutoop.data_types import CameraIntrinsicsBase
 from functools import partial
 import os
 
+def resize_pose_map_fast(pose_map, target_w, target_h):
+    # (C, H, W) → (H, W, C)
+    pose_hwC = np.transpose(pose_map, (1, 2, 0))
+
+    # Resize all C channels *at once* using NEAREST
+    resized_hwC = cv2.resize(
+        pose_hwC, (target_w, target_h), interpolation=cv2.INTER_NEAREST
+    )
+
+    # (H, W, C) → (C, H, W)
+    pose_C = np.transpose(resized_hwC, (2, 0, 1))
+    return pose_C
+
 def updated_intrinsics_after_crop(
     K: np.ndarray,
     crop_top: int, crop_left: int,
@@ -29,7 +42,84 @@ def updated_intrinsics_after_crop(
     K_new[1, 2] -= crop_top
     return K_new
 
-def resize_like_vggt(img, depth=None, heat=None, pose=None, K=None):
+def resize_like_vggt_and_dpt(
+    img, depth=None, heat=None, pose=None, K=None,
+    target_width=384   # width divisible by patch_size=16
+):
+    """
+    Steps:
+    1. Crop image height -> 480 (your original logic)
+    2. Crop pose height by half the same amount
+    3. Resize image to (512, new_h)
+    4. Resize pose with the same (sx, sy)
+    5. Update K after crop + resize
+    """
+
+    # ---------------------------------------------------------
+    # (0) Rigid crop image -> 480 height
+    # ---------------------------------------------------------
+    H, W = img.shape[:2]
+    target_h = 480
+
+    if H != target_h:
+        start_h = (H - target_h) // 2
+        end_h   = start_h + target_h
+
+        # Image crops
+        img = img[start_h:end_h]
+        if depth is not None:
+            depth = depth[start_h:end_h]
+        if heat is not None:
+            heat = heat[start_h:end_h]
+
+        # Pose crop is half-resolution
+        if pose is not None:
+            start_h_p = start_h // 2
+            end_h_p   = end_h   // 2
+            pose = pose[start_h_p:end_h_p]
+
+        # Update K for the crop
+        if K is not None:
+            K = updated_intrinsics_after_crop(K, crop_top=start_h, crop_left=0)
+
+    # ---------------------------------------------------------
+    # (1) Resize image -> width=592, height proportional
+    # ---------------------------------------------------------
+    Hc, Wc = img.shape[:2]         # (480, 640)
+    sx = target_width / float(Wc)  # 592 / 640 = 0.925
+    sy = sx                        # keep aspect ratio
+
+    new_h = int(round(Hc * sy))    # 480 * 0.925 = 444
+
+    # Resize image & dense heads
+    img_r = cv2.resize(img, (target_width, new_h), interpolation=cv2.INTER_LINEAR)
+    depth_r = cv2.resize(depth, (target_width, new_h), interpolation=cv2.INTER_NEAREST) if depth is not None else None
+    heat_r  = cv2.resize(heat, (target_width, new_h), interpolation=cv2.INTER_LINEAR) if heat is not None else None
+
+    # Resize pose with same (sx, sy)
+    if pose is not None:
+        pose_h, pose_w = pose.shape[:2]
+        pose_new_w = int(round(pose_w * sx))
+        pose_new_h = int(round(pose_h * sy))
+        pose_r = cv2.resize(pose, (pose_new_w, pose_new_h), interpolation=cv2.INTER_NEAREST)
+    else:
+        pose_r = None
+
+    # ---------------------------------------------------------
+    # (2) Update intrinsics for resize
+    # ---------------------------------------------------------
+    if K is not None:
+        K = K.copy()
+        K[0,0] *= sx
+        K[1,1] *= sy
+        K[0,2] *= sx
+        K[1,2] *= sy
+
+    return img_r, depth_r, heat_r, pose_r, K
+    # return img, depth, heat, pose, K
+
+
+def resize_like_vggt(img, depth=None, heat=None, pose=None, K=None, resize = False, patch_size=14, target_width=518):
     """
     Resize so that WIDTH≈518 (multiple of patch), preserve aspect ratio.
     Pad to patch multiple.  Update intrinsics accordingly.

@@ -5,16 +5,191 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from src.models.layers import PatchEmbed, PatchEmbed_Mlp
-from src.models.layers.block import Block
-from src.models.layers.rope import RotaryPositionEmbedding2D, PositionGetter
-from src.models.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from models.layers import PatchEmbed, PatchEmbed_Mlp
+from models.layers.block import Block
+from models.layers.rope import RotaryPositionEmbedding2D, PositionGetter
+# from models.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from dinov3.dinov3.models.vision_transformer import vit_base, vit_small
 
 logger = logging.getLogger(__name__)
 
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
+
+class DINOv3Backbone(nn.Module):
+    """
+    Wraps DinoVisionTransformer so that forward(x) returns the same
+    dict interface as your old DINOv2 backbone, including
+    "x_norm_patchtokens".
+    """
+
+    def __init__(
+        self,
+        img_size=592,
+        patch_size=16,
+        checkpoint_path=None,
+    ):
+        super().__init__()
+
+        # This creates a DinoVisionTransformer
+        # self.model = vit_base(
+        #     patch_size=patch_size,
+        #     img_size=img_size,
+        # )
+        self.model = vit_small(
+            patch_size=patch_size,
+            img_size=img_size,
+        )
+
+        if checkpoint_path is not None:
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            # allow extra keys: storage_tokens, bias_mask, ls1/ls2.gamma, etc.
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+            print("Loaded DINOv3 vit_base:")
+            print("  missing keys   :", missing)
+            print("  unexpected keys:", unexpected)
+
+        # Freeze backbone
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+
+        # expose for VGGT
+        self.embed_dim = self.model.embed_dim
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: [B, 3, H, W]
+
+        DinoVisionTransformer.forward_features(x, masks=None) returns a dict:
+        {
+            "x_norm_clstoken": ...,
+            "x_storage_tokens": ...,
+            "x_norm_patchtokens": ...,
+            "x_prenorm": ...,
+            "masks": ...
+        }
+        """
+        out = self.model.forward_features(x, masks=None)
+        return out  # <-- IMPORTANT: a dict, not CLS tensor
+    
+# def DINOv3PatchEmbed(
+#     img_size=592,
+#     patch_size=16,
+#     num_register_tokens=4,
+#     checkpoint_path=None,
+# ):
+#     """
+#     Load DINOv3 ViT-B/16 via torch.hub so the architecture matches
+#     the pretrained checkpoint exactly.
+#     """
+#     # Use official DINOv3 hub entry
+#     # model = torch.hub.load(
+#     #     'facebookresearch/dinov3',
+#     #     'dinov3_vitb16',
+#     #     pretrained=False
+#     # )
+
+#     model = vit_base(
+#         patch_size=patch_size,
+#         img_size=img_size,
+#         num_register_tokens=num_register_tokens,
+#     )
+
+#     if checkpoint_path is not None:
+#         state_dict = torch.load(checkpoint_path, map_location="cpu")
+#         # allow extra keys: storage_tokens, bias_mask, ls1/ls2.gamma, etc.
+#         missing, unexpected = model.load_state_dict(state_dict, strict=False)
+#         print("Loaded DINOv3 vit_base:")
+#         print("  missing keys   :", missing)
+#         print("  unexpected keys:", unexpected)
+
+
+#     # Resize positional embeddings for your custom image size
+#     # model.patch_embed.img_size = (img_size, img_size)
+#     # model.pos_embed = nn.Parameter(
+#     #     torch.nn.functional.interpolate(
+#     #         model.pos_embed.unsqueeze(0),
+#     #         size=(img_size // patch_size, img_size // patch_size),
+#     #         mode='bicubic',
+#     #         align_corners=False
+#     #     ).squeeze(0)
+#     # )
+
+#     # Freeze
+#     for p in model.parameters():
+#         p.requires_grad = False
+
+#     return model
+
+# def DINOv3PatchEmbed(img_size=592, patch_size=16, num_register_tokens=4, checkpoint_path=None):
+#     """
+#     Wrapper for DINOv3 ViT-B/16 returning patch tokens only.
+#     img_size and patch_size can be arbitrary (positional
+#     embeddings automatically resized).
+#     """
+
+#     # Load pretrained DINOv3 ViT-B/16
+#     model = vit_base(
+#         patch_size=patch_size,
+#         img_size=img_size,
+#         num_register_tokens=num_register_tokens,
+#     )
+
+#     # Load weights (either a URL or local path)
+#     # if download_url is not None:
+#     #     state_dict = torch.hub.load_state_dict_from_url(download_url, map_location="cpu")
+#     #     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+#     #     print("Loaded DINOv3, missing:", missing, "unexpected:", unexpected)
+#     if checkpoint_path is not None:
+#         state_dict = torch.load(checkpoint_path, map_location="cpu")
+#         model.load_state_dict(state_dict)
+#         # missing, unexpected = model.load_state_dict(state_dict, strict=True)
+
+
+#     # IMPORTANT: Freeze
+#     for p in model.parameters():
+#         p.requires_grad = False
+
+#     return model
+# class DINOv3PatchEmbed(nn.Module):
+#     """
+#     Wrapper for DINOv3 ViT-B/16 returning patch tokens only.
+#     img_size and patch_size can be arbitrary (positional
+#     embeddings automatically resized).
+#     """
+
+#     def __init__(self, img_size=592, patch_size=16, num_register_tokens=4, download_url="/home/mirshad7/HunyuanWorld-Mirror/models/dinov3/dinov3/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"):
+#         super().__init__()
+
+#         # Load pretrained DINOv3 ViT-B/16
+#         self.model = vit_base(
+#             patch_size=patch_size,
+#             img_size=img_size,
+#             num_register_tokens=num_register_tokens,
+#         )
+
+#         # Load weights (either a URL or local path)
+#         if download_url is not None:
+#             state_dict = torch.hub.load_state_dict_from_url(download_url, map_location="cpu")
+#             missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+#             print("Loaded DINOv3, missing:", missing, "unexpected:", unexpected)
+
+#         # IMPORTANT: Freeze
+#         for p in self.model.parameters():
+#             p.requires_grad = False
+
+        # self.embed_dim = self.model.embed_dim
+        # self.patch_size = patch_size
+        # self.img_size = img_size
+
+    # def forward(self, x):
+    #     """
+    #     x: [B, C, H, W]
+    #     Returns patch tokens only.
+    #     """
+    #     out = self.model.prepare_tokens(x)
+    #     return out  # [B, N, embed_dim]
 
 class VisualGeometryTransformer(nn.Module):
     """
@@ -23,27 +198,37 @@ class VisualGeometryTransformer(nn.Module):
     A simplified VGGT using only depth conditioning (no camera, no rays).
     """
 
+    # model = DinoVisionTransformer(
+    #     patch_size=patch_size,
+    #     embed_dim=768,
+    #     depth=12,
+    #     num_heads=12,
+    #     ffn_ratio=4,
+    #     **kwargs,
+    # )
+    
     def __init__(
         self,
-        img_size: int = 518,
-        patch_size: int = 14,
-        embed_dim: int = 512,
-        depth: int = 12,
-        num_heads: int = 8,
+        img_size: int = 512,
+        patch_size: int = 16,
+        embed_dim: int = 384,
+        depth: int = 4,
+        num_heads: int = 6,
         mlp_ratio: float = 4.0,
         num_register_tokens: int = 4,
         block_fn: nn.Module = Block,
         qkv_bias: bool = True,
         proj_bias: bool = True,
         ffn_bias: bool = True,
-        patch_embed: str = "dinov2_vitb14_reg",
+        patch_embed: str = "dinov3",
         qk_norm: bool = True,
         rope_freq: int = 100,
         init_values: float = 0.01,
         enable_cond: bool = False,     # depth conditioning toggle
         sampling_strategy: str = "uniform",
         fixed_patch_embed: bool = True,
-        intermediate_idxs: List[int] = [2, 5, 7, 11],
+        # intermediate_idxs: List[int] = [2, 5, 7, 11],
+        intermediate_idxs=[1, 2, 3]
     ):
         super().__init__()
 
@@ -109,6 +294,32 @@ class VisualGeometryTransformer(nn.Module):
                     img_size=img_size, patch_size=patch_size,
                     in_chans=in_chans, embed_dim=embed_dim
                 )
+
+        elif "dinov3" in patch_embed_type:
+            # from src.models.layers.dinov3_patch_embed import DINOv3PatchEmbed
+
+            checkpoint_paths = {
+                "dinov3_vitb16": "/home/mirshad7/HunyuanWorld-Mirror/dinov3/dinov3/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+                "dinov3_vits16": "/home/mirshad7/HunyuanWorld-Mirror/dinov3/dinov3/checkpoints/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+            }
+
+            mod = DINOv3Backbone(
+                img_size=img_size,
+                patch_size=patch_size,
+                checkpoint_path=checkpoint_paths.get(patch_embed_type, None),
+            )
+            # print("hereee")
+            # checkpoint_paths = {
+            #     "dinov3_vitb16": "/home/mirshad7/HunyuanWorld-Mirror/dinov3/dinov3/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"  # put link here
+            # }
+
+            # mod = DINOv3PatchEmbed(
+            #     img_size=img_size,
+            #     patch_size=patch_size,
+            #     num_register_tokens=num_reg_tokens,
+            #     checkpoint_path=checkpoint_paths.get(patch_embed_type, None)
+            # )
+
         else:
             vit_models = {
                 "dinov2_vitl14_reg": vit_large,
@@ -165,14 +376,18 @@ class VisualGeometryTransformer(nn.Module):
         b, seq_len, ch, h, w = images.shape
         assert ch == 3, f"Expected RGB images with 3 channels, got {ch}"
 
+        # print("Input images shape:", images.shape)
+
         # normalize and patchify
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             images = (images - self._resnet_mean) / self._resnet_std
             images = images.view(b * seq_len, ch, h, w)
+            # print("Normalized images shape:", images.shape)
             patch_tokens = self.patch_embed(images)
             if isinstance(patch_tokens, dict):
+                # print("DICT PATCH TOKENS++++++++++++++++++++++++++++++++++++++++++++++++, taking x_norm_patchtokens")
                 patch_tokens = patch_tokens["x_norm_patchtokens"]
-
+        #print("Patch tokens shape:", patch_tokens.shape)
         _, patch_count, tok_dim = patch_tokens.shape
         assert tok_dim == self.model_dim, f"Patch tokens {tok_dim}, expected {self.model_dim}"
 
@@ -224,10 +439,12 @@ class VisualGeometryTransformer(nn.Module):
         if pos is not None:
             pos = pos.view(*pos_shape)
 
-        if self.training:
-            tokens = checkpoint(self.blocks[idx], tokens, pos=pos, use_reentrant=self.use_reentrant)
-        else:
-            tokens = self.blocks[idx](tokens, pos=pos)
+        # if self.training:
+        #     tokens = checkpoint(self.blocks[idx], tokens, pos=pos, use_reentrant=self.use_reentrant)
+        # else:
+        #     tokens = self.blocks[idx](tokens, pos=pos)
+
+        tokens = self.blocks[idx](tokens, pos=pos)
         return tokens.view(b, seq_len, patch_count, embed_dim)
 
 

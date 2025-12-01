@@ -26,7 +26,7 @@ except Exception:
 import io, numpy as np, json, torch, webdataset as wds
 import sys
 # sys.path.append("/home/mirshad7/HunyuanWorld-Mirror/training/data/datasets")
-from .utils import get_intrinsic_matrix, resize_like_vggt
+from .utils import get_intrinsic_matrix, resize_like_vggt, resize_like_vggt_and_dpt
 #from utils import get_intrinsic_matrix, resize_like_vggt
 import os
 import glob
@@ -104,14 +104,17 @@ def build_sope_wds_loader(
     shuffle_samples=True,
     seed=42,
     resampled=False,
+    epoch=0,
+    normalize_rgb = False,
 ):
     """Single-node WebDataset loader with correct worker sharding and IID shuffling."""
     shard_paths = sorted(glob.glob(f"{shards_glob}/*.tar"))
+    # shard_paths = glob.glob(f"{shards_glob}/*.tar")
     assert len(shard_paths) > 0, f"No shards found in {shards_glob}"
 
     # Global shard shuffle
     if shuffle_shards:
-        random.Random(seed).shuffle(shard_paths)
+        random.Random(seed + epoch).shuffle(shard_paths)
 
     # Lazily generate shard list per worker
     shard_source = (
@@ -130,10 +133,14 @@ def build_sope_wds_loader(
     if shuffle_samples:
         pipeline.append(wds.shuffle(bufsize, initial=initial))
 
-    pipeline += [
-        wds.map(decode_sope_sample),
-        wds.batched(batch_size, partial=True),
-    ]
+    # pipeline += [
+    #     wds.map(decode_sope_sample, kwargs={"normalize_rgb": normalize_rgb}),
+    #     wds.batched(batch_size, partial=True),
+    # ]
+
+    pipeline.append(wds.map(lambda sample: decode_sope_sample(sample, normalize_rgb=normalize_rgb)))
+    pipeline.append(wds.batched(batch_size, partial=True))
+
 
     dataset = wds.DataPipeline(*pipeline)
 
@@ -230,7 +237,7 @@ def build_sope_wds_loader(
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
-def decode_sope_sample(sample):
+def decode_sope_sample(sample, normalize_rgb = False):
     color_bytes = sample.get("color.png")
     depth_bytes = sample.get("depth.exr")
     meta_bytes  = sample.get("meta.json")
@@ -250,14 +257,17 @@ def decode_sope_sample(sample):
         pose = np.load(io.BytesIO(pose_bytes))["abs_pose"]
     image_width, image_height = color.shape[1], color.shape[0]
     K = get_intrinsic_matrix(meta.camera.intrinsics, image_width, image_height)
-    color, depth, heat, pose, K = resize_like_vggt(color, depth=depth, heat=heat, pose=pose, K=K)
+    # color, depth, heat, pose, K = resize_like_vggt(color, depth=depth, heat=heat, pose=pose, K=K)
+    color, depth, heat, pose, K = resize_like_vggt_and_dpt(color, depth=depth, heat=heat, pose=pose, K=K)
     if depth is None or color is None:
         raise ValueError("Color/Depth decode returned None")
     rgb = torch.from_numpy(np.ascontiguousarray(color)).permute(2, 0, 1).float() / 255.0
     depth_t = torch.from_numpy(np.ascontiguousarray(depth)).unsqueeze(0).float()
     # Clamp depth to reasonable range to avoid memory explosion
     depth_t = depth_t.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0).clamp_(0, 25.0)
-    rgb = (rgb - IMAGENET_MEAN) / IMAGENET_STD
+
+    if normalize_rgb:
+        rgb = (rgb - IMAGENET_MEAN) / IMAGENET_STD
     out = {"rgb": rgb, "depth": depth_t, "K": torch.from_numpy(K).float()}
     if heat is not None and pose is not None:
         out["heatmap"] = torch.from_numpy(np.ascontiguousarray(heat)).unsqueeze(0).float()

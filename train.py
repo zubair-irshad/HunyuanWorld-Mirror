@@ -1,84 +1,106 @@
 import os
+import gc
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+# from torch.amp import autocast, GradScaler
 import torchvision
 import numpy as np
 import cv2
 import wandb
 from tqdm import tqdm
 
+# Dataloader
+from training.data.datasets.webdataloader_utils import build_sope_wds_loader
+
+# Model
 from models.models.centersnap_foundation_pose import WorldMirrorCenterSnap
-from training.data.datasets.sope_dataloader import DynamicCenterSnapLoader
-from training.data.datasets.sope_dataset import SopeCentersnapDataset
+
+# Utils
+from training.data.datasets.utils import (
+    extract_peaks_from_centroid,
+    extract_abs_pose_from_peaks,
+    draw_peaks,
+)
 from cutoop.utils import draw_3d_bbox, draw_pose_axes
-from training.data.datasets.utils import extract_peaks_from_centroid, extract_abs_pose_from_peaks, draw_peaks
 from cutoop.data_types import CameraIntrinsicsBase
-
 from training.losses.loss import compute_loss
+from models.utils.priors import normalize_depth_fixed
 
-from models.utils.priors import normalize_depth
+
+# ==========================================================
+# HParams used for WDS loader
+# ==========================================================
+class HParams:
+    def __init__(self):
+        self.batch_size = 20
+        self.num_workers = 3
+
+        # paths to WDS shards
+        # self.shards = "/mnt/ssd/SOPE_webdataset"
+        # self.test_shards = "/mnt/ssd/SOPE_webdataset_test"
+
+        self.shards = "/mnt/ssd/SOPE_webdataset"
+        self.test_shards = "/home/mirshad7/Downloads/data/Omni6DPose/SOPE_webdataset_test"
+
+        # training settings
+        self.num_epochs = 20
+        self.depth_norm = True
 
 
-# ------------------------------------------------------------------
-#  Helper: visualization for wandb
-# ------------------------------------------------------------------
+# ==========================================================
+# Visualization
+# ==========================================================
 @torch.no_grad()
-def make_visualizations(batch, preds, draw_gt = False, save_dir=None):
-    """Builds RGB, depth, overlay heatmap, pose, and peaks visualization grid."""
-
-    rgb = batch["rgb"].detach().cpu()
-    depth = batch["depth"].detach().cpu()
-    intrinsics = batch["K"].detach().cpu()
-    valid_mask = batch["valid_mask"].cpu()
-
-    print("rgb, depth, intrinsics, valid_mask shapes:", rgb.shape, depth.shape, intrinsics.shape, valid_mask.shape)
+def make_visualizations(batch, preds, draw_gt=False, save_dir=None):
+    rgb = batch["rgb"].cpu()                 # [B,3,H,W]
+    depth = batch["depth"].cpu()             # [B,1,H,W]
+    intrinsics = batch["K"].cpu()
 
     if draw_gt:
-        pose_pred = batch["pose_map"].detach().to(torch.float32).cpu()  # <-- cast here
-        heat_pred = batch["heatmap"].detach().to(torch.float32).cpu()   # <-- cast here
-
-        print("GT")
-        print("heatmap, pose shapes:", heat_pred.shape, pose_pred.shape)
-
+        heat_pred = batch["heatmap"].cpu()
+        pose_pred = batch["pose_map"].cpu()
     else:
-        pose_pred = preds["pose_map"].detach().to(torch.float32).cpu()  # <-- cast here
-        heat_pred = preds["heatmap"].detach().to(torch.float32).cpu()   # <-- cast here
-        heat_pred = heat_pred.squeeze(1)          # [B,H,W]
-        pose_pred = pose_pred.squeeze(1)        # [B,12,H,W]
-        print("Predictions")
-        print("heatmap, pose shapes:", heat_pred.shape, pose_pred.shape)
+        heat_pred = preds["heatmap"].detach().cpu()  # [B,1,H,W]
+        pose_pred = preds["pose_map"].detach().cpu()  # [B,12,H,W]
+        heat_pred = heat_pred.squeeze(1)  # [B,H,W]
+        pose_pred = pose_pred.squeeze(1)  # [B,12,H,W]
+    
+    # print("rgb, depth, heat_pred, pose_pred shapes:", rgb.shape, depth.shape, heat_pred.shape, pose_pred.shape)
+    B = min(4, rgb.shape[0])
 
-    B = rgb.shape[0]
-
-    colored_depth_list, colored_heatmap_list, overlay_list, pose_vis, peaks_vis = [], [], [], [], []
+    colored_depth_list = []
+    colored_heatmap_list = []
+    overlay_list = []
+    pose_vis = []
+    peaks_vis = []
 
     for idx in range(B):
         rgb_np = rgb[idx].permute(1, 2, 0).numpy().clip(0, 1)
+
+        # --- depth ---
         d = depth[idx, 0].numpy()
         d_norm = (d - np.nanmin(d)) / (np.nanmax(d) - np.nanmin(d) + 1e-8)
         d_color = cv2.applyColorMap((d_norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
         d_color = cv2.cvtColor(d_color, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
-        # heatmap color
-        h_pred = heat_pred[idx, 0].numpy().clip(0, 1)
+        # --- heatmap ---
+        # h_pred = heat_pred[idx, 0].numpy().clip(0, 1)
+        h_pred = heat_pred[idx, 0].to(torch.float32).cpu().numpy()
         h_color = cv2.applyColorMap((h_pred * 255).astype(np.uint8), cv2.COLORMAP_JET)
         h_color = cv2.cvtColor(h_color, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         overlay = cv2.addWeighted(rgb_np, 0.6, h_color, 0.4, 0)
 
-        # peaks extraction & drawing
-        heatmap_peaks = torch.from_numpy(h_pred)
-        peaks = extract_peaks_from_centroid(heatmap_peaks, min_distance=10, min_confidence=0.2)
+        # --- peaks ---
+        peaks = extract_peaks_from_centroid(torch.from_numpy(h_pred), 10, 0.2)
         peaks_img = draw_peaks(h_pred, peaks)
         peaks_vis.append(torch.from_numpy(peaks_img).permute(2, 0, 1))
 
-        # abs_pose_output = pose_pred[idx].permute(1, 2, 0).numpy()
-        print("pose pred shape:", pose_pred.shape)  # <-- debug print
-        abs_pose_output = pose_pred[idx].permute(1, 2, 0).numpy().astype(np.float32)
-        abs_poses, sizes = extract_abs_pose_from_peaks(peaks, abs_pose_output, scale_factor=4)
+        # --- pose extraction ---
+        # abs_pose_output = pose_pred[idx].permute(1, 2, 0).numpy().astype(np.float32)
+        abs_pose_output = pose_pred[idx].permute(1, 2, 0).to(torch.float32).cpu().numpy()
+        abs_poses, sizes = extract_abs_pose_from_peaks(peaks, abs_pose_output, scale_factor=2)
 
         intr = CameraIntrinsicsBase(
             fx=intrinsics[idx, 0, 0].item(),
@@ -88,25 +110,26 @@ def make_visualizations(batch, preds, draw_gt = False, save_dir=None):
             width=rgb_np.shape[1],
             height=rgb_np.shape[0],
         )
+
         vis_img = rgb_np.copy()
         for T, size in zip(abs_poses, sizes):
-            vis_img = draw_3d_bbox(vis_img, intrinsics=intr, sRT_4x4=T, bbox_side_len=size)
-            vis_img = draw_pose_axes(vis_img, intrinsics=intr, sRT_4x4=T, length=0.1)
+            vis_img = draw_3d_bbox(vis_img, intr, T, size)
+            vis_img = draw_pose_axes(vis_img, intr, T, length=0.1)
 
         colored_depth_list.append(torch.from_numpy(d_color).permute(2, 0, 1))
         colored_heatmap_list.append(torch.from_numpy(h_color).permute(2, 0, 1))
         overlay_list.append(torch.from_numpy(overlay).permute(2, 0, 1))
         pose_vis.append(torch.from_numpy(vis_img).permute(2, 0, 1))
 
+    # final grid
     grid = torchvision.utils.make_grid(
         torch.cat(
             [
-                rgb,
+                rgb[:B],
                 torch.stack(colored_depth_list),
-                valid_mask.float().repeat(1, 3, 1, 1),
                 torch.stack(overlay_list),
                 torch.stack(pose_vis),
-                torch.stack(peaks_vis),
+                torch.stack(peaks_vis)
             ],
             dim=0,
         ),
@@ -118,117 +141,219 @@ def make_visualizations(batch, preds, draw_gt = False, save_dir=None):
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
-        torchvision.utils.save_image(grid, os.path.join(save_dir, "train_vis.png"))
+        torchvision.utils.save_image(grid, f"{save_dir}/vis.png")
+
     return grid
 
 
-# ------------------------------------------------------------------
-#  Training script
-# ------------------------------------------------------------------
+# ==========================================================
+# Training
+# ==========================================================
 def train():
-    wandb.init(project="centersnap-sope", name="wm_centersnap_v1")
+    hparams = HParams()
+    wandb.init(project="centersnap-sope-transformer", name="wm_centersnap_wds_v1")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Dataset and loader
-    root = "/home/mirshad7/Downloads/data/Omni6DPose/SOPE"
-    train_ds = SopeCentersnapDataset(root=root, compute_targets=True)
-    loader_builder = DynamicCenterSnapLoader(train_ds, num_workers=6, batch_size=8)
-    train_loader = loader_builder.get_loader(epoch=0)
-
+    # -------------------------
     # Model
+    # -------------------------
     model = WorldMirrorCenterSnap(
-        img_size=518,
-        patch_size=14,
-        embed_dim=512,
+        img_size=384,
+        patch_size=16,
+        embed_dim=384,
+        patch_embed="dinov3_vits16",
         use_depth_condition=True,
     ).to(device)
 
+    print("model param counts (M):")
     enc_params, dec_params, enc_trainable, dec_trainable = model.param_counts()
-    wandb.config.update(
-        {"encoder_params": enc_params, "decoder_params": dec_params, "total_params": enc_params + dec_params}
-    )
-    print(f"Encoder: {enc_params/1e6:.2f}M | Decoders: {dec_params/1e6:.2f}M")
-    print(f"Trainable Encoder: {enc_trainable/1e6:.2f}M | Trainable Decoders: {dec_trainable/1e6:.2f}M")
+    print(f" Encoder:  {enc_params/1e6:.2f}M total | {enc_trainable/1e6:.2f}M trainable")
+    print(f" Decoders: {dec_params/1e6:.2f}M total | {dec_trainable/1e6:.2f}M trainable")
 
-    num_training_steps = len(train_loader) * 20
+    optimizer = AdamW(model.parameters(), lr=5e-5, weight_decay=0.05)
+    # scaler = GradScaler(enabled=True)
 
+    total_training_steps = hparams.num_epochs * 18000  # rough estimate
+    scheduler = CosineAnnealingLR(optimizer, T_max=total_training_steps, eta_min=1e-8)
 
-    # Optimizer and scheduler
-    optimizer = AdamW(model.parameters(), lr=1e-5, weight_decay=0.05)
-    # scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=2e-5)
-    scheduler = CosineAnnealingLR(optimizer, T_max=num_training_steps, eta_min=1e-8)
-    scaler = GradScaler(enabled=True)
-
-    # Training loop
-    model.train()
     global_step = 0
-    for epoch in range(50):
-        loader = loader_builder.get_loader(epoch)
-        epoch_loss = 0
-        for i, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch}")):
-            rgb = batch["rgb"].to(device)
-            depth = batch["depth"].to(device)
+    log_interval = 100  # how often to log
+    running_loss = 0.0
+    running_dict = {
+        "heatmap_loss": 0.0,
+        "abs_rot_loss": 0.0,
+        "tran_size_loss": 0.0,
+        "pose_loss": 0.0,
+    }
+    # ==========================================================
+    # Epoch Loop
+    # ==========================================================
+    for epoch in range(hparams.num_epochs):
 
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    print(f"  {k}: {v.shape} | min: {v.min().item():.4f}, max: {v.max().item():.4f}")
+        # -----------------------------------------
+        # Build new epoch loader (WDS style)
+        # -----------------------------------------
+        train_loader = build_sope_wds_loader(
+            shards_glob=hparams.shards,
+            batch_size=hparams.batch_size,
+            num_workers=hparams.num_workers,
+            bufsize=2000,
+            initial=500,
+            epoch=epoch,
+            normalize_rgb=False,   # RAW RGB — IMPORTANT
+        )
 
-    
-            depth = normalize_depth(depth)
+        model.train()
+        epoch_loss = 0.0
+        num_batches = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch}"):
 
-            print(f"  depth after norm: {depth.shape} | min: {depth.min().item():.4f}, max: {depth.max().item():.4f}")
+            rgb = batch["rgb"].to(device)  # [B,3,H,W]
+            depth = normalize_depth_fixed(batch["depth"]).to(device)
 
-            with autocast(dtype=torch.bfloat16):
-                preds = model(rgb, depth)
-
-                print("Predictions:")
-                for k,v in preds.items():
-                    if isinstance(v, torch.Tensor):
-                        print(f"  {k}: {v.shape} | min: {v.min().item():.4f}, max: {v.max().item():.4f}")
-                print("===============================================================================\n\n")
-
-                loss, loss_dict = compute_loss(preds, batch)
-                loss_heat = 100* loss_dict["heatmap_loss"]
-                loss_pose = loss_dict["pose_loss"]
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
 
-            wandb.log(
-                {
-                    "train/loss": loss.item(),
-                    "train/loss_heat": loss_heat,
-                    "train/loss_pose": loss_pose,
-                    "lr": optimizer.param_groups[0]["lr"],
-                },
-                step=global_step,
+            # with autocast(dtype=torch.bfloat16, device_type='cuda'):
+            # with autocast(dtype=torch.float16, device_type='cuda'):
+            preds = model(rgb, depth)  # transformer takes [B,S,3,H,W]
+            loss, loss_dict = compute_loss(preds, batch)
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            # ---- Mixed precision ----
+            
+            # scaler.scale(loss).backward()
+            # scaler.step(optimizer)
+            # scaler.update()
+            # scheduler.step()
+
+           # ---- Accumulate for averaging ----
+            running_loss += loss.detach()
+            for k in running_dict.keys():
+                if k in loss_dict:
+                    running_dict[k] += loss_dict[k]
+
+            epoch_loss += loss.detach()
+                    
+            num_batches += 1
+            global_step += 1
+            
+            # ---- Log every N steps ----
+            if (global_step + 1) % log_interval == 0:
+                avg_loss = (running_loss / log_interval)
+                avg_dict = {k: (v / log_interval) for k, v in running_dict.items()}
+
+                wandb.log(
+                    {
+                        "train/total_loss": avg_loss,
+                        "train/heatmap_loss": avg_dict["heatmap_loss"],
+                        "train/rot_loss": avg_dict["abs_rot_loss"],
+                        "train/tran_size_loss": avg_dict["tran_size_loss"],
+                        "train/pose_loss": avg_dict["pose_loss"],
+                        "lr": optimizer.param_groups[0]["lr"],
+                    },
+                    step=global_step,
+                )
+                # reset accumulators
+                running_loss = 0.0
+                for k in running_dict.keys():
+                    running_dict[k] = 0.0
+            # wandb.log(
+            #     {
+            #         "train/loss": loss.item(),
+            #         "train/heatmap_loss": loss_dict["heatmap_loss"],
+            #         "train/pose_loss": loss_dict["pose_loss"],
+            #         "lr": optimizer.param_groups[0]["lr"],
+            #     },
+            #     step=global_step,
+            # )
+
+            # epoch_loss += loss.item()
+            # global_step += 1
+
+            # --- Visualization ---
+            if global_step == 1 or global_step % 14000 == 0:
+                grid_gt = make_visualizations(batch, preds, draw_gt=True)
+                wandb.log({"train/vis_gt": wandb.Image(grid_gt)}, step=global_step)
+
+                grid_pred = make_visualizations(batch, preds, draw_gt=False)
+                wandb.log({"train/vis_pred": wandb.Image(grid_pred)}, step=global_step)
+                del grid_gt, grid_pred
+        
+        avg_loss = (epoch_loss / num_batches)
+        wandb.log({"epoch_loss": avg_loss}, step=global_step)
+        print(f"Epoch {epoch}: avg_loss {avg_loss:.4f}")
+
+        del train_loader
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # ==========================================================
+        # Test loop (added)
+        # ==========================================================
+        model.eval()
+        with torch.no_grad():
+            test_loader = build_sope_wds_loader(
+                shards_glob=hparams.test_shards,
+                batch_size=hparams.batch_size,
+                num_workers=hparams.num_workers,
+                bufsize=500,
+                initial=100
             )
 
-            epoch_loss += loss.item()
-            global_step += 1
+            test_epoch_loss = 0
+            # test_loss_each = {"heatmap_loss": 0, "pose_loss": 0, "rot_loss": 0, "trans_loss": 0, "size_loss": 0}
+            test_loss_each = {"heatmap_loss": 0, "abs_rot_loss": 0, "tran_size_loss": 0, "pose_loss": 0}
+            # pbar_test = tqdm(test_loader, desc=f"Test Epoch {epoch}")
+            # for batch in pbar_test:
+            num_test_batches = 0
+            for batch in tqdm(test_loader, desc=f"Test Epoch {epoch}"):
+                depth = normalize_depth_fixed(batch["depth"])
+                rgb = batch["rgb"].to(device, non_blocking=True)
+                depth = depth.to(device, non_blocking=True)
+                preds = model(rgb, depth)
+                loss, loss_dict = compute_loss(preds, batch)
+                test_epoch_loss += loss.detach()
+                num_test_batches += 1
 
-            if global_step ==1 or global_step % 250 == 0:
-                grid_gt = make_visualizations(batch, preds, draw_gt = True)
-                wandb.log({"train/visualizations_gt": wandb.Image(grid_gt)}, step=global_step)
+                if num_test_batches%1200 == 0:
+                    #Visualization only on rank 0 to avoid multi-process contention.
+                    grid_gt_test = make_visualizations(batch, preds, draw_gt=True)
+                    wandb.log({"test/visualizations_gt": wandb.Image(grid_gt_test)}, step=global_step)
+                    grid_pred_test = make_visualizations(batch, preds, draw_gt=False)
+                    wandb.log({"test/visualizations_pred": wandb.Image(grid_pred_test)}, step=global_step)
+                    del grid_gt_test, grid_pred_test
 
-                grid_pred = make_visualizations(batch, preds, draw_gt = False)
-                wandb.log({"train/visualizations_pred": wandb.Image(grid_pred)}, step=global_step)
+                #compute all different losses rot, trans, size, heatmap, pose
+                #add them all up and visualize at end of testing epoch
+                for k in test_loss_each.keys():
+                    test_loss_each[k] += loss_dict[k]
 
-        avg_loss = epoch_loss / len(loader)
-        print(f"Epoch {epoch}: avg_loss={avg_loss:.4f}")
-        wandb.log({"epoch_loss": avg_loss}, step=global_step)
+
+            avg_test_loss = (test_epoch_loss / num_test_batches)
+            if torch.is_tensor(avg_test_loss):
+                avg_test_loss = avg_test_loss.item()
+            for k in test_loss_each.keys():
+                test_loss_each[k] /= num_test_batches
+                wandb.log({f"test/{k}": test_loss_each[k]}, step=global_step)
+            print(f"Epoch {epoch}: avg_test_loss={avg_test_loss:.4f}")
+            wandb.log({"test/epoch_loss": avg_test_loss}, step=global_step)
+                
+            # End of test epoch
+            del test_loader
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # save checkpoint
-        if (epoch + 1) % 5 == 0:
-            ckpt_path = f"checkpoints/centersnap_epoch_{epoch+1}.pt"
-            os.makedirs("checkpoints", exist_ok=True)
-            torch.save({"model": model.state_dict(), "epoch": epoch, "optimizer": optimizer.state_dict()}, ckpt_path)
-            wandb.save(ckpt_path)
+        if (epoch + 1) % 2 == 0:
+            os.makedirs("checkpoints_transformer", exist_ok=True)
+            path = f"checkpoints_transformer/transformer_epoch_{epoch+1}.pt"
+            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch}, path)
+            wandb.save(path)
 
-    print("Training completed!")
+    print("Training complete!")
 
 
 if __name__ == "__main__":

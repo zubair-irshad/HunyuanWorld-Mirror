@@ -7,31 +7,31 @@ from typing import Dict, List, Tuple, Optional
 from models.models.visual_transformer import VisualGeometryTransformer
 from models.heads.dense_head import DPTHead
 
-# ------- Loss helpers -------
-def mse_loss(pred: torch.Tensor, target: torch.Tensor, valid: Optional[torch.Tensor] = None):
-    """
-    Standard MSE. If valid mask is provided (same HxW broadcastable),
-    we compute mean over valid pixels only.
-    """
-    if valid is not None:
-        # valid assumed to be {0,1}, shape [B,1,H,W] or [B,H,W]
-        w = (valid > 0).float()
-        num = torch.clamp(w.sum(), min=1.0)
-        return ((pred - target) ** 2 * w).sum() / num
-    return torch.mean((pred - target) ** 2)
+# # ------- Loss helpers -------
+# def mse_loss(pred: torch.Tensor, target: torch.Tensor, valid: Optional[torch.Tensor] = None):
+#     """
+#     Standard MSE. If valid mask is provided (same HxW broadcastable),
+#     we compute mean over valid pixels only.
+#     """
+#     if valid is not None:
+#         # valid assumed to be {0,1}, shape [B,1,H,W] or [B,H,W]
+#         w = (valid > 0).float()
+#         num = torch.clamp(w.sum(), min=1.0)
+#         return ((pred - target) ** 2 * w).sum() / num
+#     return torch.mean((pred - target) ** 2)
 
-def masked_l1(pred: torch.Tensor, target: torch.Tensor, valid: Optional[torch.Tensor] = None):
-    """
-    Masked L1 for pose maps. If no valid provided, reduces to mean L1.
-    """
-    if valid is not None:
-        w = (valid > 0).float()
-        num = torch.clamp(w.sum(), min=1.0)
-        # broadcast mask to channel dims if needed
-        while w.ndim < pred.ndim:
-            w = w.expand(-1, pred.size(1), -1, -1)
-        return (torch.abs(pred - target) * w).sum() / num
-    return torch.mean(torch.abs(pred - target))
+# def masked_l1(pred: torch.Tensor, target: torch.Tensor, valid: Optional[torch.Tensor] = None):
+#     """
+#     Masked L1 for pose maps. If no valid provided, reduces to mean L1.
+#     """
+#     if valid is not None:
+#         w = (valid > 0).float()
+#         num = torch.clamp(w.sum(), min=1.0)
+#         # broadcast mask to channel dims if needed
+#         while w.ndim < pred.ndim:
+#             w = w.expand(-1, pred.size(1), -1, -1)
+#         return (torch.abs(pred - target) * w).sum() / num
+#     return torch.mean(torch.abs(pred - target))
 
 
 class WorldMirrorCenterSnap(nn.Module):
@@ -50,12 +50,11 @@ class WorldMirrorCenterSnap(nn.Module):
 
     def __init__(
         self,
-        img_size: int = 518,
-        patch_size: int = 14,
-        embed_dim: int = 512,
+        img_size: int = 512,
+        patch_size: int = 16,
+        embed_dim: int = 384,
         patch_embed: str = "dinov2_vitb14_reg",
-        fixed_patch_embed: bool = False,
-        enable_interpolation: bool = False,
+        fixed_patch_embed: bool = True,
         max_resolution: int = 2044,
         condition_strategy: List[str] = ("token", "pow3r", "token"),
         use_depth_condition: bool = True,
@@ -69,21 +68,24 @@ class WorldMirrorCenterSnap(nn.Module):
 
 
         self.encoder = VisualGeometryTransformer(
-            img_size=518,
-            patch_size=14,
-            embed_dim=512,
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            patch_embed = patch_embed,
+            fixed_patch_embed=fixed_patch_embed,
             enable_cond=True,       # to enable depth conditioning
         )
 
         dec_in = self.encoder.model_dim   # <-- ViT-B/14 => 768
-        print("dec_in", dec_in)
+        # print("dec_in", dec_in)
 
         # 1) Heatmap head: 1 channel
         self.heatmap_head = DPTHead(
             dim_in=dec_in,
             output_dim=1,
             patch_size=patch_size,
-            activation="linear",  # "sigmoid"
+            activation="linear",  # "sigmoid",
+            backbone_type ="vit_small",
         )
 
         # 2) Pose map head: 12 channels
@@ -92,6 +94,8 @@ class WorldMirrorCenterSnap(nn.Module):
             output_dim=12,
             patch_size=patch_size,
             activation="linear",  # identity / None
+            down_ratio = 2,  # downsample pose map by 2x,
+            backbone_type ="vit_small",
         )
 
     @torch.no_grad()

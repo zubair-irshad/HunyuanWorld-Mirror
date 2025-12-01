@@ -37,11 +37,13 @@ class DPTHead(nn.Module):
         patch_size: int = 14,
         output_dim: int = 4,
         activation: str = "inv_log+expp1",
-        features: int = 256,
-        out_channels: List[int] = [256, 512, 1024, 1024],
+        # features: int = 256,
+        features: int = 128,
+        # out_channels: List[int] = [256, 512, 1024, 1024],
         pos_embed: bool = True,
         down_ratio: int = 1,
-        is_gsdpt: bool = False
+        is_gsdpt: bool = False,
+        backbone_type: str = "vit_base",
     ) -> None:
         super(DPTHead, self).__init__()
         self.patch_size = patch_size
@@ -50,24 +52,57 @@ class DPTHead(nn.Module):
         self.down_ratio = down_ratio
         self.is_gsdpt = is_gsdpt
 
+        if backbone_type == "vit_small":
+            # out_channels = [256, 512, 1024]   # 3 scales
+            out_channels = [128, 256, 256]
+            # out_channels = [256, 512]
+        elif backbone_type == "vit_base":
+            out_channels = [256, 512, 1024, 1024]   # 4 scales
+            
         self.norm = nn.LayerNorm(dim_in)
         # Projection layers for each output channel from tokens.
         self.projects = nn.ModuleList([nn.Conv2d(in_channels=dim_in, out_channels=oc, kernel_size=1, stride=1, padding=0) for oc in out_channels])
         # Resize layers for upsampling feature maps.
-        self.resize_layers = nn.ModuleList(
-            [
-                nn.ConvTranspose2d(
-                    in_channels=out_channels[0], out_channels=out_channels[0], kernel_size=4, stride=4, padding=0
-                ),
-                nn.ConvTranspose2d(
-                    in_channels=out_channels[1], out_channels=out_channels[1], kernel_size=2, stride=2, padding=0
-                ),
-                nn.Identity(),
-                nn.Conv2d(
-                    in_channels=out_channels[3], out_channels=out_channels[3], kernel_size=3, stride=2, padding=1
-                ),
-            ]
-        )
+
+
+        # --- Dynamic Resize Layers ---
+        self.resize_layers = nn.ModuleList()
+        num_scales = len(out_channels)
+
+        for i in range(num_scales):
+            if i == 0:
+                # highest resolution → upscale by 4
+                self.resize_layers.append(
+                    nn.ConvTranspose2d(out_channels[i], out_channels[i], 4, 4)
+                )
+            elif i == 1:
+                # second → upscale by 2
+                self.resize_layers.append(
+                    nn.ConvTranspose2d(out_channels[i], out_channels[i], 2, 2)
+                )
+            elif i == 2:
+                # third → identity
+                self.resize_layers.append(nn.Identity())
+            else:
+                # for ViT-base where i == 3
+                self.resize_layers.append(
+                    nn.Conv2d(out_channels[i], out_channels[i], 3, 2, 1)
+                )
+                
+        # self.resize_layers = nn.ModuleList(
+        #     [
+        #         nn.ConvTranspose2d(
+        #             in_channels=out_channels[0], out_channels=out_channels[0], kernel_size=4, stride=4, padding=0
+        #         ),
+        #         nn.ConvTranspose2d(
+        #             in_channels=out_channels[1], out_channels=out_channels[1], kernel_size=2, stride=2, padding=0
+        #         ),
+        #         nn.Identity(),
+        #         nn.Conv2d(
+        #             in_channels=out_channels[3], out_channels=out_channels[3], kernel_size=3, stride=2, padding=1
+        #         ),
+        #     ]
+        # )
         self.scratch = _make_scratch(out_channels, features, expand=False)
 
         # Attach additional modules to scratch.
@@ -271,24 +306,52 @@ class DPTHead(nn.Module):
         Returns:
             Tensor: Fused feature map.
         """
-        layer_1, layer_2, layer_3, layer_4 = features
+        # print("features lengths:", len(features))
 
+        if len(features) == 4:
+            layer_1, layer_2, layer_3, layer_4 = features
+        elif len(features) == 3:
+            layer_1, layer_2, layer_3 = features
+            layer_4 = None
+        else:
+            raise ValueError("Unsupported number of ViT feature scales")
+        
+        #layer_1, layer_2, layer_3, layer_4 = features
+
+        # layer_1_rn = self.scratch.layer1_rn(layer_1)
+        # layer_2_rn = self.scratch.layer2_rn(layer_2)
+        # layer_3_rn = self.scratch.layer3_rn(layer_3)
+        # layer_4_rn = self.scratch.layer4_rn(layer_4)
+
+        # out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+        # del layer_4_rn, layer_4
+
+        # out = self.scratch.refinenet3(out, layer_3_rn, size=layer_2_rn.shape[2:])
+        # del layer_3_rn, layer_3
+
+        # out = self.scratch.refinenet2(out, layer_2_rn, size=layer_1_rn.shape[2:])
+        # del layer_2_rn, layer_2
+
+        # out = self.scratch.refinenet1(out, layer_1_rn)
+        # del layer_1_rn, layer_1
+
+        # out = self.scratch.output_conv1(out)
+        # return out
         layer_1_rn = self.scratch.layer1_rn(layer_1)
         layer_2_rn = self.scratch.layer2_rn(layer_2)
         layer_3_rn = self.scratch.layer3_rn(layer_3)
-        layer_4_rn = self.scratch.layer4_rn(layer_4)
 
-        out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
-        del layer_4_rn, layer_4
-
-        out = self.scratch.refinenet3(out, layer_3_rn, size=layer_2_rn.shape[2:])
-        del layer_3_rn, layer_3
+        if layer_4 is not None:
+            layer_4_rn = self.scratch.layer4_rn(layer_4)
+            out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+            out = self.scratch.refinenet3(out, layer_3_rn, size=layer_2_rn.shape[2:])
+        else:
+            # start from scale 3
+            out = layer_3_rn
+            out = self.scratch.refinenet3(out, layer_3_rn, size=layer_2_rn.shape[2:])
 
         out = self.scratch.refinenet2(out, layer_2_rn, size=layer_1_rn.shape[2:])
-        del layer_2_rn, layer_2
-
         out = self.scratch.refinenet1(out, layer_1_rn)
-        del layer_1_rn, layer_1
 
         out = self.scratch.output_conv1(out)
         return out

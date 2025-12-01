@@ -6,3 +6,6 @@ inference_output/
 submodules/gsplat/examples/pycolmap/
 skyseg.onnx
 wandb/
+checkpoints/
+dinov3/dinov3/checkpoints/
+checkpoints_transformer/

@@ -43,7 +43,7 @@ from torch.utils.data import get_worker_info
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
-def decode_sope_sample(sample):
+def decode_sope_sample(sample, normalize_rgb=False):
     color_bytes = sample.get("color.png")
     depth_bytes = sample.get("depth.exr")
     meta_bytes  = sample.get("meta.json")
@@ -336,61 +336,61 @@ os.environ.update({
 #     print(f"[WDS] Initialized loader with {len(shard_paths)} shards, {num_workers} workers")
 #     return loader
 
-def build_sope_wds_loader(
-    shards_glob,
-    num_workers=2,
-    batch_size=2,
-    bufsize=5000,
-    initial=500,
-    shuffle_shards=True,
-    shuffle_samples=True,
-    seed=42,
-    resampled=False,
-):
-    """Single-node WebDataset loader with correct worker sharding and IID shuffling."""
-    shard_paths = sorted(glob.glob(f"{shards_glob}/*.tar"))
-    assert len(shard_paths) > 0, f"No shards found in {shards_glob}"
+# def build_sope_wds_loader(
+#     shards_glob,
+#     num_workers=2,
+#     batch_size=2,
+#     bufsize=2000,
+#     initial=500,
+#     shuffle_shards=True,
+#     shuffle_samples=True,
+#     seed=42,
+#     resampled=False,
+# ):
+#     """Single-node WebDataset loader with correct worker sharding and IID shuffling."""
+#     shard_paths = sorted(glob.glob(f"{shards_glob}/*.tar"))
+#     assert len(shard_paths) > 0, f"No shards found in {shards_glob}"
 
-    # Global shard shuffle
-    if shuffle_shards:
-        random.Random(seed).shuffle(shard_paths)
+#     # Global shard shuffle
+#     if shuffle_shards:
+#         random.Random(seed).shuffle(shard_paths)
 
-    # Lazily generate shard list per worker
-    shard_source = (
-        (lambda: wds.SimpleShardList(shard_paths))
-        if not resampled
-        else (lambda: wds.ResampledShards(shard_paths))
-    )
+#     # Lazily generate shard list per worker
+#     shard_source = (
+#         (lambda: wds.SimpleShardList(shard_paths))
+#         if not resampled
+#         else (lambda: wds.ResampledShards(shard_paths))
+#     )
 
-    # Build the pipeline
-    pipeline = [
-        shard_source,
-        wds.split_by_worker,  # ✅ unique shards per worker
-        wds.tarfile_to_samples(handler=wds.handlers.warn_and_continue),
-    ]
+#     # Build the pipeline
+#     pipeline = [
+#         shard_source,
+#         wds.split_by_worker,  # ✅ unique shards per worker
+#         wds.tarfile_to_samples(handler=wds.handlers.warn_and_continue),
+#     ]
 
-    if shuffle_samples:
-        pipeline.append(wds.shuffle(bufsize, initial=initial))
+#     if shuffle_samples:
+#         pipeline.append(wds.shuffle(bufsize, initial=initial))
 
-    pipeline += [
-        wds.map(decode_sope_sample),
-        wds.batched(batch_size, partial=True),
-    ]
+#     pipeline += [
+#         wds.map(decode_sope_sample),
+#         wds.batched(batch_size, partial=True),
+#     ]
 
-    dataset = wds.DataPipeline(*pipeline)
+#     dataset = wds.DataPipeline(*pipeline)
 
-    # Build PyTorch-style DataLoader
-    loader = wds.WebLoader(
-        dataset,
-        num_workers=num_workers,
-        batch_size=None,  # batching handled by WebDataset
-        pin_memory=True,
-        prefetch_factor=(2 if num_workers > 0 else None),
-        persistent_workers=False,
-    )
+#     # Build PyTorch-style DataLoader
+#     loader = wds.WebLoader(
+#         dataset,
+#         num_workers=num_workers,
+#         batch_size=None,  # batching handled by WebDataset
+#         pin_memory=True,
+#         prefetch_factor=(2 if num_workers > 0 else None),
+#         persistent_workers=False,
+#     )
 
-    print(f"[WDS] Loader initialized: {len(shard_paths)} shards | {num_workers} workers | batch {batch_size}")
-    return loader
+#     print(f"[WDS] Loader initialized: {len(shard_paths)} shards | {num_workers} workers | batch {batch_size}")
+#     return loader
 
 # def build_test_wds_loader(shards_glob, num_workers=2, batch_size=4, epoch=0):
 
@@ -515,17 +515,80 @@ def build_sope_wds_loader(
 #     )
 #     return loader
 
+def build_sope_wds_loader(
+    shards_glob,
+    num_workers=3,
+    batch_size=4,
+    bufsize=2000,
+    initial=500,
+    shuffle_shards=True,
+    shuffle_samples=True,
+    seed=42,
+    resampled=False,
+    epoch=0,
+    normalize_rgb = False,
+):
+    """Single-node WebDataset loader with correct worker sharding and IID shuffling."""
+    shard_paths = sorted(glob.glob(f"{shards_glob}/*.tar"))
+    # shard_paths = glob.glob(f"{shards_glob}/*.tar")
+    assert len(shard_paths) > 0, f"No shards found in {shards_glob}"
+
+    # Global shard shuffle
+    if shuffle_shards:
+        random.Random(seed + epoch).shuffle(shard_paths)
+
+    # Lazily generate shard list per worker
+    shard_source = (
+        (lambda: wds.SimpleShardList(shard_paths))
+        if not resampled
+        else (lambda: wds.ResampledShards(shard_paths))
+    )
+
+    # Build the pipeline
+    pipeline = [
+        shard_source,
+        wds.split_by_worker,  # ✅ unique shards per worker
+        wds.tarfile_to_samples(handler=wds.handlers.warn_and_continue),
+    ]
+
+    if shuffle_samples:
+        pipeline.append(wds.shuffle(bufsize, initial=initial))
+
+    # pipeline += [
+    #     wds.map(decode_sope_sample, kwargs={"normalize_rgb": normalize_rgb}),
+    #     wds.batched(batch_size, partial=True),
+    # ]
+
+    pipeline.append(wds.map(lambda sample: decode_sope_sample(sample, normalize_rgb=normalize_rgb)))
+    pipeline.append(wds.batched(batch_size, partial=True))
+
+
+    dataset = wds.DataPipeline(*pipeline)
+
+    # Build PyTorch-style DataLoader
+    loader = wds.WebLoader(
+        dataset,
+        num_workers=num_workers,
+        batch_size=None,  # batching handled by WebDataset
+        pin_memory=True,
+        prefetch_factor=(4 if num_workers > 0 else None),
+        persistent_workers=False,
+    )
+
+    print(f"[WDS] Loader initialized: {len(shard_paths)} shards | {num_workers} workers | batch {batch_size}")
+    return loader
+
 # ----------------------------
 # 🚀 Test loop
 # ----------------------------
 if __name__ == "__main__":
     # shards = "/home/mirshad7/Downloads/data/Omni6DPose/SOPE_test/sope-{000000..000003}.tar"
 
-    root = "/home/mirshad7/Downloads/data/Omni6DPose/SOPE_webdataset"
+    root = "/mnt/ssd/SOPE_webdataset"
 
     for epoch in range(3):  # few epochs
         print(f"\n=== Epoch {epoch} ===")
-        loader = build_sope_wds_loader(root, num_workers=2, batch_size=20)
+        loader = build_sope_wds_loader(root, num_workers=3, batch_size=8)
 
         # unique_keys = set()
         # num_batches = 0
